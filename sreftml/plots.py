@@ -412,6 +412,8 @@ def learning_history_plot(
 def histogram_plot(
     df: pd.DataFrame,
     col_name: list[str] | str,
+    x_label: str,
+    y_label: str,
     hue: str | None = None,
     sharex: bool = True,
     sharey: bool = True,
@@ -451,7 +453,8 @@ def histogram_plot(
     )
     g.map(plt.hist, "value", alpha=0.4)
     g.add_legend()
-    g.set_titles("{col_name}")
+    g.set_titles("")
+    g.set_axis_labels(x_label, y_label)
 
     if save_file_path:
         g.savefig(save_file_path, transparent=True)
