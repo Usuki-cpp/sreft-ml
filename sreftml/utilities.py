@@ -1,9 +1,13 @@
 import math
+import pickle
 import subprocess
 import warnings
 
+import autograd.numpy as agnp
+import lifelines
 import numpy as np
 import pandas as pd
+import shap
 import sklearn.preprocessing as sp
 import statsmodels.formula.api as smf
 import tensorflow as tf
@@ -311,7 +315,7 @@ def clean_duplicate(
     return df_
 
 
-def compute_permutation_importance(
+def compute_permutation_importance_(
     random_seed: int,
     sreft: tf.keras.Model,
     x_test: np.ndarray,
@@ -321,7 +325,7 @@ def compute_permutation_importance(
     n_sample: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Compute permutation importance of the model.
+    [Superseded] Compute permutation importance of the model.
 
     Args:
         random_seed (int): The seed for the random number generator.
@@ -368,12 +372,67 @@ def compute_permutation_importance(
     return np.array(mean_pi), np.array(std_pi)
 
 
+def compute_permutation_importance(
+    random_seed: int,
+    sreft: tf.keras.Model,
+    cov_test: np.ndarray,
+    m_test: np.ndarray,
+    n_sample: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Compute permutation importance of the model.
+
+    Args:
+        random_seed (int): The seed for the random number generator.
+        sreft (tf.keras.Model): The model for which to calculate permutation importance.
+        cov_test (np.ndarray): The covariates test data.
+        m_test (np.ndarray): The m test data.
+        n_sample (int): The number of samples.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]: The mean and standard deviation of the permutation importance.
+    """
+    rng = np.random.default_rng(random_seed)
+    offestt_pred = sreft.model_1(np.concatenate((m_test, cov_test), axis=-1)).numpy()
+
+    mean_pi = []
+    std_pi = []
+    n_pi = m_test.shape[1] + cov_test.shape[1]
+
+    for i in range(n_pi):
+        pis = []
+        for j in range(n_sample):
+            if i < m_test.shape[1]:
+                m_test_rand = np.copy(m_test)
+                rng.shuffle(m_test_rand[:, i])
+                y_pred_rand = sreft.model_1(
+                    np.concatenate((m_test_rand, cov_test), axis=-1)
+                ).numpy()
+            else:
+                cov_test_rand = np.copy(cov_test)
+                rng.shuffle(cov_test_rand[:, i - m_test.shape[1]])
+                y_pred_rand = sreft.model_1(
+                    np.concatenate((m_test, cov_test_rand), axis=-1)
+                ).numpy()
+
+            nglls_diff = (offestt_pred - y_pred_rand) ** 2
+            temp_pi = np.nanmean(nglls_diff)
+            pis.append(temp_pi)
+
+        mean_pi.append(np.mean(pis))
+        std_pi.append(np.std(pis))
+
+    return np.array(mean_pi), np.array(std_pi)
+
+
 def calculate_offsetT_prediction(
     sreft: tf.keras.Model,
     df: pd.DataFrame,
     scaled_features: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
     scaler_y: sp.StandardScaler,
     name_biomarkers: list[str],
+    getOffsetT: bool = True,
+    getPrediction: bool = True,
 ) -> pd.DataFrame:
     """
     Calculate offsetT and prediction value of biomarkers.
@@ -390,10 +449,224 @@ def calculate_offsetT_prediction(
     """
     df_ = df.copy()
     x_scaled, cov_scaled, m_scaled, y_scaled = scaled_features
-    offsetT = sreft.model_1(np.concatenate((m_scaled, cov_scaled), axis=-1))
-    y_pred = pd.DataFrame(
-        scaler_y.inverse_transform(sreft(scaled_features)),
-        columns=[f"{biomarker}_pred" for biomarker in name_biomarkers],
-    )
-    df_ = df_.assign(offsetT=offsetT, **y_pred)
+
+    if getOffsetT:
+        offsetT = sreft.model_1(np.concatenate((m_scaled, cov_scaled), axis=-1))
+        df_ = df_.reset_index(drop=True).assign(offsetT=offsetT)
+
+    if getPrediction:
+        y_pred = pd.DataFrame(
+            scaler_y.inverse_transform(sreft(scaled_features)),
+            columns=[f"{biomarker}_pred" for biomarker in name_biomarkers],
+        )
+        df_ = df_.reset_index(drop=True).assign(**y_pred)
+
     return df_
+
+
+class GompertzFitter(lifelines.fitters.ParametricUnivariateFitter):
+    _fitted_parameter_names = ["lambda_", "c_"]
+
+    def _cumulative_hazard(self, params, times):
+        lambda_, c_ = params
+        return lambda_ / c_ * (agnp.expm1(times * c_))
+
+
+def survival_analysis(
+    df: pd.DataFrame,
+    surv_time: str,
+    event: str,
+    useOffsetT: bool = True,
+    gompertz_init_params: list = [0.1, 0.1],
+) -> dict:
+    """
+    Perform survival analysis and return a dictionary of survival analysis objects.
+
+
+    If the survival time contains 0 or less, the survival time is converted so that the minimum value is 0.00001.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+        surv_time (str): Column name of the survival time in df.
+        event (str): Column name of the event in df.
+        useOffsetT (bool, optional): Determines whether to use offsetT for the analysis. Defaults to True.
+
+    Returns:
+        dict: A dictionary of survival analysis objects.
+    """
+    fitters = [
+        (lifelines.KaplanMeierFitter, "kmf", "KaplanMeier"),
+        (lifelines.NelsonAalenFitter, "naf", "NelsonAalen"),
+        (lifelines.ExponentialFitter, "epf", "Exponential"),
+        (lifelines.WeibullFitter, "wbf", "Weibull"),
+        (GompertzFitter, "gpf", "Gompertz"),
+        (lifelines.LogLogisticFitter, "llf", "LogLogistic"),
+        (lifelines.LogNormalFitter, "lnf", "LogNormal"),
+    ]
+    fit_model = {"title": event}
+    if useOffsetT:
+        df_surv = df[["ID", "offsetT", surv_time, event]].dropna().drop_duplicates()
+
+        if df_surv["offsetT"].min() < 0:
+            raise ValueError("offsetT must be greater than or equal to 0.")
+
+        for fitter_class, key, label in fitters:
+            if key == "gpf":
+                fit_model[key] = fitter_class(label=label).fit(
+                    durations=df_surv["offsetT"] + df_surv[surv_time],
+                    event_observed=df_surv[event],
+                    entry=df_surv["offsetT"],
+                    initial_point=gompertz_init_params,
+                )
+            else:
+                fit_model[key] = fitter_class(label=label).fit(
+                    durations=df_surv["offsetT"] + df_surv[surv_time],
+                    event_observed=df_surv[event],
+                    entry=df_surv["offsetT"],
+                )
+    else:
+        df_surv = df[["ID", surv_time, event]].dropna().drop_duplicates()
+        for fitter_class, key, label in fitters:
+            fit_model[key] = fitter_class(label=label).fit(
+                durations=df_surv[surv_time], event_observed=df_surv[event]
+            )
+
+    return fit_model
+
+
+def multi_column_filter(
+    df: pd.DataFrame,
+    upper_lim: dict[str, float] = None,
+    lower_lim: dict[str, float] = None,
+    IQR_filter: list = None,
+):
+    """
+    Applies limits and IQR filtering on DataFrame columns.
+
+    Operations:
+        NaN substitution for values outside the specified upper and lower limits.
+        IQR-based outlier removal in specified columns.
+
+    Args:
+        df (pd.DataFrame): The DataFrame to be filtered.
+        upper_lim (dict[str, float], optional): Upper limits per column.
+        lower_lim (dict[str, float], optional): Lower limits per column.
+        IQR_filter (list, optional): Columns for IQR outlier detection
+
+    Returns:
+        pd.DataFrame: DataFrame after applying the defined filters.
+
+    Notes:
+        Overlapping `upper_lim`/`lower_lim` and `IQR_filter` keys cause warnings
+        and filtering by `upper_lim`/`lower_lim`.
+    """
+    df_filtered = df.copy()
+    if upper_lim is None:
+        upper_lim = {}
+    if lower_lim is None:
+        lower_lim = {}
+    if IQR_filter is None:
+        IQR_filter = []
+
+    if upper_lim:
+        for k, v in upper_lim.items():
+            df_filtered.loc[df_filtered[k] > v, k] = np.nan
+        overlap_upper_IQR = set(upper_lim.keys()) & set(IQR_filter)
+        if overlap_upper_IQR:
+            warnings.warn(
+                f"The columns {overlap_upper_IQR} were present in both upper_lim and IQR_filter, therefore they were filtered using the values from upper_lim."
+            )
+
+    if lower_lim:
+        for k, v in lower_lim.items():
+            df_filtered.loc[df_filtered[k] < v, k] = np.nan
+        overlap_lower_IQR = set(lower_lim.keys()) & set(IQR_filter)
+        if overlap_lower_IQR:
+            warnings.warn(
+                f"The columns {overlap_lower_IQR} were present in both lower_lim and IQR_filter, therefore they were filtered using the values from lower_lim."
+            )
+
+    if IQR_filter:
+        IQR_exclusive = list(
+            set(IQR_filter) - set(upper_lim.keys()) - set(lower_lim.keys())
+        )
+        q1 = df_filtered.quantile(0.25)
+        q3 = df_filtered.quantile(0.75)
+        iqr = q3 - q1
+        df_filtered[IQR_exclusive] = df_filtered[IQR_exclusive].mask(
+            (df_filtered < q1 - 1.5 * iqr) | (df_filtered > q3 + 1.5 * iqr), np.nan
+        )
+
+    return df_filtered
+
+
+def calc_shap_explanation(
+    sreft: tf.keras.Model,
+    feature_names: list[str],
+    cov_scaled: np.ndarray,
+    m_scaled: np.ndarray,
+) -> shap.Explanation:
+    """
+    Calculate the SHAP values for model 1.
+
+    Args:
+        sreft (tf.keras.Model): The model for which to calculate SHAP values.
+        feature_names (list[str]): Provide the column names for 'm' and 'cov'. 'm' comes first, followed by 'cov'.
+        cov_scaled (np.ndarray): The scaled covariate values.
+        m_scaled (np.ndarray): The scaled m values.
+
+    Returns:
+        shap.Explanation: The explanation of SHAP values.
+    """
+    input1 = np.concatenate((m_scaled, cov_scaled), axis=-1)
+    explainer_model_1 = shap.Explainer(
+        sreft.model_1,
+        input1,
+        algorithm="permutation",
+        seed=42,
+        feature_names=feature_names,
+    )
+    shap_value_model_1 = explainer_model_1(input1)
+    shap_exp_model_1 = shap.Explanation(
+        shap_value_model_1.values,
+        shap_value_model_1.base_values[0][0],
+        shap_value_model_1.data,
+        feature_names=feature_names,
+    )
+
+    return shap_exp_model_1
+
+
+def load_shap(
+    path_to_shap_file: str,
+) -> shap.Explanation:
+    """
+    Load the specified SHAP binary file and return the SHAP explanations.
+
+    Args:
+        path_to_shap_file (str): The path to the SHAP file.
+
+    Returns:
+        Explanation: The explanation of SHAP values.
+    """
+    with open(path_to_shap_file, "rb") as p:
+        shap_exp = pickle.load(p)
+
+    return shap_exp
+
+
+def save_shap(path_to_shap_file: str, shap_exp: shap.Explanation) -> None:
+    """
+    Save the SHAP explanations to the specified file.
+
+    Parameters:
+        path_to_shap_file (str): The path to save the SHAP file.
+        shap_exp (shap.Explanation): The SHAP explanations to be saved.
+
+    Returns:
+        None
+    """
+    with open(path_to_shap_file, "wb") as p:
+        pickle.dump(shap_exp, p)
+
+    return None
