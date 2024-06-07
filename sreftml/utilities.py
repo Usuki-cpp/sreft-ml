@@ -441,7 +441,7 @@ def calculate_offsetT_prediction(
         sreft (tf.keras.Model): The trained SReFT model.
         df (pd.DataFrame): The input DataFrame.
         scaled_features (tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]): The scaled features. Pass x, cov, m, and y in that order.
-        scaler_y (sp.StanderdScaler): The scaler for y.
+        scaler_y (sp.StandardScaler): The scaler for y.
         name_biomarkers (list[str]): List of biomarker names.
 
     Returns:
