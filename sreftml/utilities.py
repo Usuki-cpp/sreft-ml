@@ -497,11 +497,11 @@ def survival_analysis(
     fitters = [
         (lifelines.KaplanMeierFitter, "kmf", "KaplanMeier"),
         (lifelines.NelsonAalenFitter, "naf", "NelsonAalen"),
-        (lifelines.ExponentialFitter, "epf", "Exponential"),
-        (lifelines.WeibullFitter, "wbf", "Weibull"),
-        (GompertzFitter, "gpf", "Gompertz"),
-        (lifelines.LogLogisticFitter, "llf", "LogLogistic"),
-        (lifelines.LogNormalFitter, "lnf", "LogNormal"),
+        # (lifelines.ExponentialFitter, "epf", "Exponential"),
+        # (lifelines.WeibullFitter, "wbf", "Weibull"),
+        # (GompertzFitter, "gpf", "Gompertz"),
+        # (lifelines.LogLogisticFitter, "llf", "LogLogistic"),
+        # (lifelines.LogNormalFitter, "lnf", "LogNormal"),
     ]
     fit_model = {"title": event}
     if useOffsetT:
