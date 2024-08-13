@@ -54,6 +54,7 @@ def linear_regression_each_subject(
     for y in y_columns:
         slopes = []
         intercepts = []
+        counts = []
 
         for _, group in df.groupby("ID"):
             x_values = group["TIME"].values.reshape(-1, 1)
@@ -65,6 +66,7 @@ def linear_regression_each_subject(
             if valid_sample_count == 0:
                 slopes.append(np.nan)
                 intercepts.append(np.nan)
+                counts.append(valid_sample_count)
                 continue
 
             model.fit(x_values[valid_mask], y_values[valid_mask])
@@ -75,12 +77,15 @@ def linear_regression_each_subject(
                 slopes.append(model.coef_[0])
             intercepts.append(model.intercept_)
 
+            counts.append(valid_sample_count)
+
         results[f"{y}_slope"] = slopes
         results[f"{y}_intercept"] = intercepts
+        results[f"{y}_count"] = counts
 
     result = pd.DataFrame(results)
     result = result[
-        ["ID"] + [i + j for j in ["_slope", "_intercept"] for i in y_columns]
+        ["ID"] + [i + j for j in ["_slope", "_intercept", "_count"] for i in y_columns]
     ]
 
     return result
