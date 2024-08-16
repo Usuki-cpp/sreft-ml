@@ -98,6 +98,7 @@ class SReFT(tf.keras.Model):
                 self.output_dim, activation=None, kernel_initializer=initializer
             )
         )
+        self.random_state = random_state
 
     def call(
         self,
@@ -149,11 +150,29 @@ class SReFT(tf.keras.Model):
         input_cov = tf.keras.layers.Input(shape=shapes[1], name="covariate")
         input_m = tf.keras.layers.Input(shape=shapes[2], name="feature")
         input_y = tf.keras.layers.Input(shape=shapes[3], name="observation")
-
         return tf.keras.Model(
-            inputs=[input_x, input_cov, input_m],
+            inputs=[input_x, input_cov, input_m, input_y],
             outputs=self.call((input_x, input_cov, input_m, input_y)),
         )
+
+    def get_config(self):
+        config = super(SReFT, self).get_config()
+        config.update({
+            'output_dim': self.output_dim,
+            'latent_dim_model_1': self.latent_dim_model_1,
+            'latent_dim_model_y': self.latent_dim_model_y,
+            'activation_model_1_mid': self.activation_model_1_mid,
+            'activation_model_1_out': self.activation_model_1_out,
+            'activation_model_y_mid': self.activation_model_y_mid,
+            'offsetT_min': self.offsetT_min,
+            'offsetT_max': self.offsetT_max,
+            'random_state': self.random_state
+        })
+        return config
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
 
 
 def hp_search_for_sreftml(
