@@ -509,6 +509,7 @@ def survival_analysis(
         (lifelines.LogNormalFitter, "lnf", "LogNormal"),
     ]
     fit_model = {"title": event}
+    df[surv_time] = df[surv_time] + 1e-10
     if useOffsetT:
         df_surv = df[["ID", "offsetT", surv_time, event]].dropna().drop_duplicates()
 
