@@ -502,11 +502,11 @@ def survival_analysis(
     fitters = [
         (lifelines.KaplanMeierFitter, "kmf", "KaplanMeier"),
         (lifelines.NelsonAalenFitter, "naf", "NelsonAalen"),
-        # (lifelines.ExponentialFitter, "epf", "Exponential"),
-        # (lifelines.WeibullFitter, "wbf", "Weibull"),
-        # (GompertzFitter, "gpf", "Gompertz"),
-        # (lifelines.LogLogisticFitter, "llf", "LogLogistic"),
-        # (lifelines.LogNormalFitter, "lnf", "LogNormal"),
+        (lifelines.ExponentialFitter, "epf", "Exponential"),
+        (lifelines.WeibullFitter, "wbf", "Weibull"),
+        (GompertzFitter, "gpf", "Gompertz"),
+        (lifelines.LogLogisticFitter, "llf", "LogLogistic"),
+        (lifelines.LogNormalFitter, "lnf", "LogNormal"),
     ]
     fit_model = {"title": event}
     if useOffsetT:
@@ -675,3 +675,24 @@ def save_shap(path_to_shap_file: str, shap_exp: shap.Explanation) -> None:
         pickle.dump(shap_exp, p)
 
     return None
+
+
+def check_reverse_order(
+    fit_model:dict,
+    criteria:int
+) ->bool:
+    fit_model_parametric = {
+        key: value
+        for key, value in fit_model.items()
+        if key not in ["title", "kmf", "naf"]
+    }
+    gpf_params = fit_model_parametric["gpf"].params_
+
+    if gpf_params["c_"] > 10**(-criteria):
+        print("natural order")
+        check = 0
+    else:
+        print("reverse order")
+        check = 1
+
+    return gpf_params["c_"], check
