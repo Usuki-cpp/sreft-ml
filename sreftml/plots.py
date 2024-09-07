@@ -5,6 +5,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+import sys
+sys.path.append('/Users/tamutomo/miniforge3/lib/python3.10/site-packages')
 import shap
 import sklearn.preprocessing as sp
 import tensorflow as tf
@@ -134,7 +136,7 @@ def prediction_plot(
     y_data = df[name_biomarkers].values
     if useOffsetT:
         x_data = df.TIME.values + df.offsetT.values
-        cov_dummy = np.array([i for i in itertools.product([0, 1], repeat=n_covariate)])
+        cov_dummy = np.array([i for i in itertools.product([0, 1], repeat=n_covariate)]).astype(np.float64)
         cov_dummy = np.repeat(cov_dummy, res, axis=0)
         cov_dummy_scaled = scaler_cov.transform(cov_dummy)
         x_model = np.linspace(x_data.min(), x_data.max(), res)
