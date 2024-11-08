@@ -6,8 +6,9 @@ import pandas as pd
 import sklearn.preprocessing as sp
 import tensorflow as tf
 from sklearn.model_selection import GroupKFold
-
+import datetime
 from . import utilities
+import os
 
 
 class SReFT(tf.keras.Model):
@@ -185,6 +186,7 @@ def hp_search_for_sreftml(
     callbacks: list[any] | None = None,
     epochs: int = 9999,
     batch_size: int = 256,
+    save_dir: str = "/Users/tamutomo/Library/CloudStorage/OneDrive-千葉大学/lab/SReFT/ROOT/output/Grid"
 ) -> pd.DataFrame:
     """
     Perform hyperparameter search for the SReFT_ML.
@@ -204,6 +206,14 @@ def hp_search_for_sreftml(
         pd.DataFrame: Dataframe containing the hyperparameters and corresponding scores.
 
     """
+    proc_time = datetime.datetime.now().strftime("%Y%m%d%H%M%S")[2:]
+    base_save_dir = save_dir + "/" + proc_time
+    os.mkdir(base_save_dir)
+    
+    def generate_dir_name(grid_items):
+        param_str = "_".join([f"{val}" for key, val in grid_items.items()])
+        return param_str
+    
     grid_prms = [i for i in itertools.product(*grid_dict.values())]
     df_grid = pd.DataFrame(grid_prms, columns=grid_dict.keys())
     if n_grid_sample > 0:
@@ -213,8 +223,19 @@ def hp_search_for_sreftml(
 
     scores = []
     gkf = GroupKFold(n_splits=n_splits)
-    for i, (tmp_train_idx, tmp_vali_idx) in enumerate(gkf.split(X=df, groups=df.ID)):
-        for tmp_grid, grid_items in df_grid.iterrows():
+    current_iter=1
+    for tmp_grid, grid_items in df_grid.iterrows():
+        # ハイパーパラメータごとに1度だけディレクトリを生成
+        folder_name = generate_dir_name(grid_items)
+        hp_dir = os.path.join(base_save_dir, folder_name)
+        os.makedirs(hp_dir, exist_ok=True)
+        
+        for i, (tmp_train_idx, tmp_vali_idx) in enumerate(gkf.split(X=df, groups=df.ID)):
+            # 分割回ごとのディレクトリを生成
+            split_dir = os.path.join(hp_dir, f"split_{i + 1}")
+            os.makedirs(split_dir, exist_ok=True)
+            
+            
             current_iter = i * len(df_grid) + (tmp_grid + 1)
             current_hp = ", ".join([f"{j}: {grid_items[j]}" for j in grid_items.keys()])
             print(f"\n({current_iter}/{n_splits * len(df_grid)}) {current_hp} -----")
@@ -251,7 +272,17 @@ def hp_search_for_sreftml(
                 verbose=0,
                 callbacks=callbacks,
             )
+            
+            # モデルと元データセットのテスト部分の保存
+            model_path = os.path.join(split_dir, "sreft_model")
+            tmp_sreft.save(model_path, save_format="tf")
 
+            # 元データセットからのテストデータ抽出と保存
+            test_data_df = df.iloc[tmp_vali_idx]
+            test_data_path = os.path.join(split_dir, "test_data_from_df.csv")
+            test_data_df.to_csv(test_data_path, index=False)
+            
+            
             y_pred = tmp_sreft(
                 (
                     x_scaled[tmp_vali_idx, :],
@@ -264,7 +295,9 @@ def hp_search_for_sreftml(
                 y_scaled[tmp_vali_idx, :], y_pred, tmp_sreft.lnvar_y
             )
             scores.append(np.nanmean(temp_score))
-
+            
+            current_iter+=1
+            
     df_grid["score"] = np.array(scores).reshape(n_splits, -1).mean(axis=0).round(3)
 
     return df_grid
