@@ -187,24 +187,17 @@ def hp_search_for_sreftml(
     epochs: int = 9999,
     batch_size: int = 256,
     save_dir: str = "/Users/tamutomo/Library/CloudStorage/OneDrive-千葉大学/lab/SReFT/ROOT/output/Grid"
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Perform hyperparameter search for the SReFT_ML.
+    Perform hyperparameter search for the SReFT_ML with detailed iteration tracking.
 
     Args:
-        df (pd.DataFrame): Input dataframe containing the data.
-        scaled_features (tuple): Tuple of scaled feature. Pass x, cov, m and y in that order.
-        grid_dict (dict[list[any]]): Dictionary of hyperparameter names and the corresponding values to be tested.
-        n_grid_sample (int, optional): Number of samples to select randomly from the grid. Greater than 0 for random search and 0 or less for grid search. Default to 0.
-        n_splits (int, optional): Number of splits for cross-validation. 2 or more is required. Default to 3.
-        random_seed (int, optional): Random seed for reproducibility. Default to 42.
-        callbacks (list[any] | None, optional): Callbacks to be used during model training. Default to None.
-        epochs (int, optional): Specifies the number of epochs to pass to the SReFT class. Defaults to 9999.
-        batch_size (int, optional): Default to 256.
+        ...
 
     Returns:
-        pd.DataFrame: Dataframe containing the hyperparameters and corresponding scores.
-
+        tuple[pd.DataFrame, pd.DataFrame]: 
+            - df_grid: DataFrame with scores for all iterations.
+            - df_min_scores: DataFrame with the minimum score for each hyperparameter combination and its iteration.
     """
     proc_time = datetime.datetime.now().strftime("%Y%m%d%H%M%S")[2:]
     base_save_dir = save_dir + "/" + proc_time
@@ -221,24 +214,40 @@ def hp_search_for_sreftml(
 
     x_scaled, cov_scaled, m_scaled, y_scaled = scaled_features
 
+    # 評価指標の格納用に拡張
     scores = []
+    iterations = []
+    params = []
+    within_combo_iter_counts = []  # 組み合わせごとにリセットされるイテレーション番号用
     gkf = GroupKFold(n_splits=n_splits)
-    current_iter=1
+    
+    total_iterations = len(df_grid) * n_splits  # 全体のイテレーション数
+    current_total_iter = 1  # 総イテレーションカウンタ
+    
     for tmp_grid, grid_items in df_grid.iterrows():
-        # ハイパーパラメータごとに1度だけディレクトリを生成
         folder_name = generate_dir_name(grid_items)
         hp_dir = os.path.join(base_save_dir, folder_name)
         os.makedirs(hp_dir, exist_ok=True)
         
+        # 各ハイパーパラメータ組み合わせでのイテレーション番号をリセット
+        within_combo_iter = 1  # 組み合わせごとのイテレーションカウントをリセット
+        
         for i, (tmp_train_idx, tmp_vali_idx) in enumerate(gkf.split(X=df, groups=df.ID)):
-            # 分割回ごとのディレクトリを生成
             split_dir = os.path.join(hp_dir, f"split_{i + 1}")
             os.makedirs(split_dir, exist_ok=True)
             
-            
-            current_iter = i * len(df_grid) + (tmp_grid + 1)
-            current_hp = ", ".join([f"{j}: {grid_items[j]}" for j in grid_items.keys()])
-            print(f"\n({current_iter}/{n_splits * len(df_grid)}) {current_hp} -----")
+            # メッセージの作成
+            current_hp = ", ".join([f"{key}={val}" for key, val in grid_items.items()])
+            print(
+                f"----------------[ Iteration {current_total_iter} of {total_iterations} ]----------------------\n"
+                f"| Combination {tmp_grid + 1} of {len(df_grid)} | Fold {within_combo_iter} of {n_splits} |\n"
+                f"| Parameters: {current_hp:<60}|\n"
+                "-----------------------------------------------------------------"
+            )
+
+            # モデルの訓練やスコア計算などのコード...
+
+            current_total_iter += 1  # 総イテレーションカウンタの更新
 
             tmp_sreft = SReFT(
                 output_dim=y_scaled.shape[1],
@@ -273,16 +282,15 @@ def hp_search_for_sreftml(
                 callbacks=callbacks,
             )
             
-            # モデルと元データセットのテスト部分の保存
+            # モデルとテストデータの保存
             model_path = os.path.join(split_dir, "sreft_model")
             tmp_sreft.save(model_path, save_format="tf")
 
-            # 元データセットからのテストデータ抽出と保存
             test_data_df = df.iloc[tmp_vali_idx]
             test_data_path = os.path.join(split_dir, "test_data_from_df.csv")
             test_data_df.to_csv(test_data_path, index=False)
             
-            
+            # スコア計算と保存
             y_pred = tmp_sreft(
                 (
                     x_scaled[tmp_vali_idx, :],
@@ -294,10 +302,22 @@ def hp_search_for_sreftml(
             temp_score = utilities.np_compute_negative_log_likelihood(
                 y_scaled[tmp_vali_idx, :], y_pred, tmp_sreft.lnvar_y
             )
-            scores.append(np.nanmean(temp_score))
+            score_mean = np.nanmean(temp_score)
+            scores.append(score_mean)  # スコアを格納
+            iterations.append(within_combo_iter)  # 組み合わせごとにリセットされるイテレーション番号を格納
+            within_combo_iter_counts.append(within_combo_iter)  # グリッド全体に対するイテレーション番号
             
-            current_iter+=1
+            params.append(grid_items)  # 現在のパラメータ設定を格納
             
-    df_grid["score"] = np.array(scores).reshape(n_splits, -1).mean(axis=0).round(3)
+            within_combo_iter += 1  # 組み合わせ内イテレーションカウントをインクリメント
+    
+    # df_gridを更新して、各イテレーションごとのスコアとイテレーション番号を含める
+    expanded_grid = pd.DataFrame(params).reset_index(drop=True)
+    expanded_grid["score"] = scores
+    expanded_grid["combo_iter"] = within_combo_iter_counts  # 各組み合わせ内でのイテレーション番号を追加
 
-    return df_grid
+    # 各組み合わせごとの最低スコアを取得し、該当するイテレーション番号も含める
+    min_score_df = expanded_grid.loc[expanded_grid.groupby(list(grid_dict.keys()))["score"].idxmin()]
+    expanded_grid.to_csv(f"{base_save_dir}/df_grid.csv")
+    min_score_df.to_csv(f"{base_save_dir}/min_score_df.csv")
+    return expanded_grid, min_score_df
