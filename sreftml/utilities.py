@@ -13,6 +13,8 @@ import statsmodels.formula.api as smf
 import tensorflow as tf
 from sklearn.linear_model import LinearRegression
 
+import pandas as pd
+import matplotlib.pyplot as plt
 
 class NullModel:
     def __init__(self, Intercept, TIME):
@@ -483,6 +485,7 @@ def survival_analysis(
     event: str,
     useOffsetT: bool = True,
     gompertz_init_params: list = [0.1, 0.1],
+    without_fitting : bool = False
 ) -> dict:
     """
     Perform survival analysis and return a dictionary of survival analysis objects.
@@ -499,15 +502,22 @@ def survival_analysis(
     Returns:
         dict: A dictionary of survival analysis objects.
     """
-    fitters = [
-        (lifelines.KaplanMeierFitter, "kmf", "KaplanMeier"),
-        (lifelines.NelsonAalenFitter, "naf", "NelsonAalen"),
-        (lifelines.ExponentialFitter, "epf", "Exponential"),
-        (lifelines.WeibullFitter, "wbf", "Weibull"),
-        (GompertzFitter, "gpf", "Gompertz"),
-        (lifelines.LogLogisticFitter, "llf", "LogLogistic"),
-        (lifelines.LogNormalFitter, "lnf", "LogNormal"),
-    ]
+
+    if without_fitting:
+        fitters = [
+            (lifelines.KaplanMeierFitter, "kmf", "KaplanMeier"),
+            (lifelines.NelsonAalenFitter, "naf", "NelsonAalen")
+        ]
+    else:
+        fitters = [
+            (lifelines.KaplanMeierFitter, "kmf", "KaplanMeier"),
+            (lifelines.NelsonAalenFitter, "naf", "NelsonAalen"),
+            # (lifelines.ExponentialFitter, "epf", "Exponential"),
+            (lifelines.WeibullFitter, "wbf", "Weibull"),
+            # (GompertzFitter, "gpf", "Gompertz"),
+            # (lifelines.LogLogisticFitter, "llf", "LogLogistic"),
+            # (lifelines.LogNormalFitter, "lnf", "LogNormal"),
+        ]
     fit_model = {"title": event}
     df[surv_time] = df[surv_time] + 1e-10
     if useOffsetT:
@@ -539,6 +549,79 @@ def survival_analysis(
 
     return fit_model
 
+def compare_survival_by_biomarkers(
+    df: pd.DataFrame,
+    biomarkers: list[str],
+    surv_time: str,
+    event: str,
+    useOffsetT: bool = True,
+    save_dir_path: str | None = None
+):
+    """
+    Compare survival curves for high and low groups of each biomarker.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame with survival data and biomarkers.
+        biomarkers (list[str]): List of biomarker column names.
+        surv_time (str): Column name of the survival time in df.
+        event (str): Column name of the event in df.
+        useOffsetT (bool, optional): Whether to use offsetT. Defaults to True.
+        save_dir_path (str | None, optional): Path to save plots. Defaults to None.
+    """
+    for biomarker in biomarkers:
+        median_value = df[biomarker].median()
+        df["biomarker_group"] = df[biomarker] >= median_value
+
+        fig_surv, ax_surv = plt.subplots(figsize=(5, 5), dpi=300)
+        fig_cumhaz, ax_cumhaz = plt.subplots(figsize=(5, 5), dpi=300)
+        fig_haz, ax_haz = plt.subplots(figsize=(5, 5), dpi=300)
+        legend_labels = {True: f"{biomarker} >= median", False: f"{biomarker} < median"}
+
+        for group, color in zip([True, False], ["blue", "red"]):
+            df_group = df[df["biomarker_group"] == group]
+            df_group[surv_time] = df_group[surv_time] + 1e-10
+
+            fitters = [
+                (lifelines.KaplanMeierFitter, "kmf", "KaplanMeier"),
+                (lifelines.NelsonAalenFitter, "naf", "NelsonAalen")
+            ]
+
+
+            fit_model = {}
+            df_surv = df_group[["ID", "offsetT", surv_time, event]].dropna().drop_duplicates() if useOffsetT else df_group[["ID", surv_time, event]].dropna().drop_duplicates()
+
+            for fitter_class, key, label in fitters:
+                fit_model[key] = fitter_class(label=label).fit(
+                    durations=df_surv["offsetT"] + df_surv[surv_time] if useOffsetT else df_surv[surv_time],
+                    event_observed=df_surv[event],
+                    entry=df_surv["offsetT"] if useOffsetT else None,
+                )
+
+            fit_model["kmf"].plot_survival_function(ci_show=True, ax=ax_surv, label=legend_labels[group], color=color)
+            fit_model["naf"].plot_cumulative_hazard(ci_show=True, ax=ax_cumhaz, label=legend_labels[group], color=color)
+            fit_model["naf"].plot_hazard(bandwidth=2, ci_show=True, ax=ax_haz, label=legend_labels[group], color=color)
+
+        ax_surv.set_title(f"{biomarker}")
+        ax_surv.set_xlabel("Disease Time (year)")
+        ax_surv.set_ylabel("Survival Function")
+        ax_surv.legend()
+
+        ax_cumhaz.set_title(f"{biomarker}")
+        ax_cumhaz.set_xlabel("Disease Time (year)")
+        ax_cumhaz.set_ylabel("Cumulative Hazard")
+        ax_cumhaz.legend()
+
+        ax_haz.set_title(f"{biomarker}")
+        ax_haz.set_xlabel("Disease Time (year)")
+        ax_haz.set_ylabel("Hazard")
+        ax_haz.legend()
+
+        if save_dir_path:
+            fig_surv.savefig(f"{save_dir_path}/surv_func_{biomarker}.png", transparent=True)
+            fig_cumhaz.savefig(f"{save_dir_path}/cumhaz_func_{biomarker}.png", transparent=True)
+            fig_haz.savefig(f"{save_dir_path}/huz_func_{biomarker}.png", transparent=True)
+
+        plt.show()
 
 def multi_column_filter(
     df: pd.DataFrame,
@@ -605,6 +688,81 @@ def multi_column_filter(
 
     return df_filtered
 
+
+def multi_column_filter_(
+    df: pd.DataFrame,
+    upper_lim: dict[str, float] = None,
+    lower_lim: dict[str, float] = None,
+    IQR_filter: list = None,
+):
+    """
+    Applies limits and IQR filtering on DataFrame columns.
+
+    Operations:
+        NaN substitution for values outside the specified upper and lower limits.
+        IQR-based outlier removal in specified columns.
+
+    Args:
+        df (pd.DataFrame): The DataFrame to be filtered.
+        upper_lim (dict[str, float], optional): Upper limits per column.
+        lower_lim (dict[str, float], optional): Lower limits per column.
+        IQR_filter (list, optional): Columns for IQR outlier detection
+
+    Returns:
+        tuple: (Filtered DataFrame, DataFrame with count of filtered values per column)
+
+    Notes:
+        Overlapping `upper_lim`/`lower_lim` and `IQR_filter` keys cause warnings
+        and filtering by `upper_lim`/`lower_lim`.
+    """
+    df_filtered = df.copy()
+    filtered_counts = pd.DataFrame(columns=['Column', 'Filtered_Count'])
+
+    if upper_lim is None:
+        upper_lim = {}
+    if lower_lim is None:
+        lower_lim = {}
+    if IQR_filter is None:
+        IQR_filter = []
+
+    filtered_data = []
+
+    if upper_lim:
+        for k, v in upper_lim.items():
+            mask = df_filtered[k] > v
+            filtered_data.append({'Column': k, 'Filtered_Count': mask.sum()})
+            df_filtered.loc[mask, k] = np.nan
+        overlap_upper_IQR = set(upper_lim.keys()) & set(IQR_filter)
+        if overlap_upper_IQR:
+            warnings.warn(
+                f"The columns {overlap_upper_IQR} were present in both upper_lim and IQR_filter, therefore they were filtered using the values from upper_lim."
+            )
+
+    if lower_lim:
+        for k, v in lower_lim.items():
+            mask = df_filtered[k] < v
+            filtered_data.append({'Column': k, 'Filtered_Count': mask.sum()})
+            df_filtered.loc[mask, k] = np.nan
+        overlap_lower_IQR = set(lower_lim.keys()) & set(IQR_filter)
+        if overlap_lower_IQR:
+            warnings.warn(
+                f"The columns {overlap_lower_IQR} were present in both lower_lim and IQR_filter, therefore they were filtered using the values from lower_lim."
+            )
+
+    if IQR_filter:
+        IQR_exclusive = list(
+            set(IQR_filter) - set(upper_lim.keys()) - set(lower_lim.keys())
+        )
+        q1 = df_filtered.quantile(0.25)
+        q3 = df_filtered.quantile(0.75)
+        iqr = q3 - q1
+        for col in IQR_exclusive:
+            mask = (df_filtered[col] < q1[col] - 1.5 * iqr[col]) | (df_filtered[col] > q3[col] + 1.5 * iqr[col])
+            filtered_data.append({'Column': col, 'Filtered_Count': mask.sum()})
+            df_filtered.loc[mask, col] = np.nan
+
+    filtered_counts = pd.DataFrame(filtered_data)
+    return df_filtered, filtered_counts
 
 def calc_shap_explanation(
     sreft: tf.keras.Model,
@@ -679,21 +837,20 @@ def save_shap(path_to_shap_file: str, shap_exp: shap.Explanation) -> None:
 
 
 def check_reverse_order(
-    fit_model:dict,
-    criteria:int
+    fit_model:dict
 ) ->bool:
     fit_model_parametric = {
         key: value
         for key, value in fit_model.items()
         if key not in ["title", "kmf", "naf"]
     }
-    gpf_params = fit_model_parametric["gpf"].params_
+    wbf_params = fit_model_parametric["wbf"].params_
 
-    if gpf_params["c_"] > 10**(-criteria):
+    if wbf_params["rho_"] > 1:
         print("natural order")
         check = 0
     else:
         print("reverse order")
         check = 1
 
-    return gpf_params["c_"], check
+    return wbf_params["rho_"], check
