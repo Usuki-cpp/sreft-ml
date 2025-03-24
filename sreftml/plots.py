@@ -9,10 +9,12 @@ import shap
 import sklearn.preprocessing as sp
 import tensorflow as tf
 from matplotlib.colors import ListedColormap
-from scipy.stats import gaussian_kde, linregress
-
+from scipy.stats import gaussian_kde, linregress, ttest_ind
 from .make_demodata import model_sigmoid
 from .utilities import clean_duplicate, n2mfrow
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+
 
 
 def hp_search_plot(
@@ -143,6 +145,8 @@ def prediction_plot(
         y_model = scaler_y.inverse_transform(sreft.model_y(x_model))
     else:
         x_data = df.TIME.values
+        x_model = np.linspace(x_data.min(), x_data.max(), res).reshape(-1, 1)
+        y_model = scaler_y.inverse_transform(sreft.model_y(x_model))
 
     fig, axs = plt.subplots(
         n_row,
@@ -180,6 +184,7 @@ def prediction_plot(
                 )
             ax.set_xlabel("Disease Time (year)")
         else:
+            ax.plot(x_model[:, 0], y_model[:, k], c="red", lw=4)
             ax.set_xlabel("Observation Period (year)")
 
         ax.set_title(name_biomarkers[k], fontsize=15)
@@ -203,6 +208,398 @@ def prediction_plot(
     return fig
 
 
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+from scipy.stats import gaussian_kde, linregress
+import itertools
+
+def prediction_plot_(
+    sreft: tf.keras.Model,
+    df: pd.DataFrame,
+    name_biomarkers: list[str],
+    name_covariates: list[str],
+    scaler_y: StandardScaler,
+    scaler_cov: StandardScaler,
+    res: int = 100,
+    density: bool = False,
+    useOffsetT: bool = True,
+    ncol_max: int = 4,
+    colormap: ListedColormap = None,
+    save_file_path: str | None = None,
+) -> plt.Figure:
+    n_biomarker = len(name_biomarkers)
+    n_covariate = len(name_covariates)
+    n_row, n_col = n2mfrow(n_biomarker, ncol_max)
+    if colormap is None:
+        colormap = plt.colormaps["Set1"]
+
+    y_data = df[name_biomarkers].values
+    x_data = df.TIME.values
+
+    if useOffsetT:
+        x_data += df.offsetT.values
+        cov_dummy = np.array([i for i in itertools.product([0, 1], repeat=n_covariate)])
+        cov_dummy = np.repeat(cov_dummy, res, axis=0)
+        cov_dummy_scaled = scaler_cov.transform(cov_dummy)
+        x_model = np.linspace(x_data.min(), x_data.max(), res)
+        x_model = np.tile(x_model, 2**n_covariate).reshape(-1, 1)
+        x_model = np.concatenate((x_model, cov_dummy_scaled), axis=1)
+        y_model = scaler_y.inverse_transform(sreft.model_y(x_model))
+    else:
+        x_model = np.linspace(x_data.min(), x_data.max(), res).reshape(-1, 1)
+
+    fig, axs = plt.subplots(
+        n_row,
+        n_col,
+        figsize=(n_col * 3, n_row * 3),
+        tight_layout=True,
+        dpi=300,
+        sharex="row",
+    )
+
+    for k, ax in enumerate(axs.flat):
+        if k >= n_biomarker:
+            ax.axis("off")
+            continue
+
+        if density:
+            x_ = x_data[~np.isnan(y_data[:, k])]
+            y_ = y_data[~np.isnan(y_data[:, k]), k]
+            if np.var(x_) == 0:
+                z = gaussian_kde(y_)(y_)
+            else:
+                xy = np.vstack([x_, y_])
+                z = gaussian_kde(xy)(xy)
+            idx = z.argsort()
+            ax.scatter(x_[idx], y_[idx], c=z[idx], s=2, label="_nolegend_")
+        else:
+            ax.scatter(x_data, y_data[:, k], c="silver", s=2, label="_nolegend_")
+
+        if useOffsetT:
+            for i in range(2**n_covariate):
+                ax.plot(
+                    x_model[res * i : res * (i + 1), 0],
+                    y_model[res * i : res * (i + 1), k],
+                    c=colormap(i),
+                    lw=4,
+                )
+            ax.set_xlabel("Disease Time (year)")
+        else:
+            valid_idx = ~np.isnan(y_data[:, k])
+            x_valid = x_data[valid_idx]
+            y_valid = y_data[valid_idx, k]
+            if len(x_valid) > 1 and np.var(x_valid) > 0:
+                slope, intercept, r_value, p_value, std_err = linregress(x_valid, y_valid)
+                n = len(x_valid)
+                ci = 1.96 * std_err * np.sqrt(1 + (1 / n))  # 信頼区間の幅を調整
+
+                y_pred = slope * x_model[:, 0] + intercept
+                y_upper = y_pred + ci
+                y_lower = y_pred - ci
+
+                # NaN値がある場合は補完
+                y_upper = np.nan_to_num(y_upper)
+                y_lower = np.nan_to_num(y_lower)
+
+                ax.plot(x_model[:, 0], y_pred, c="red", lw=4)
+                ax.fill_between(x_model[:, 0], y_lower, y_upper, color="red", alpha=0.3)
+
+                ax.legend([f"Slope: {slope:.3f} ± {ci:.3f}"], loc="upper left")
+
+        ax.set_title(name_biomarkers[k], fontsize=15)
+
+    if n_covariate > 0 and useOffsetT:
+        legend_labels = [
+            ", ".join(format(i, f"0{n_covariate}b")) for i in range(2**n_covariate)
+        ]
+        fig.legend(
+            loc="center",
+            framealpha=0,
+            bbox_to_anchor=(1.1, 0.5),
+            ncol=1,
+            title=", ".join(name_covariates),
+            labels=legend_labels,
+        )
+
+    if save_file_path is not None:
+        fig.savefig(save_file_path, transparent=True, bbox_inches="tight")
+
+    return fig
+
+
+
+def prediction_plot__(
+    sreft: tf.keras.Model,
+    df: pd.DataFrame,
+    name_biomarkers: list[str],
+    name_covariates: list[str],
+    scaler_y: StandardScaler,
+    scaler_cov: StandardScaler,
+    res: int = 100,
+    density: bool = False,
+    useOffsetT: bool = True,
+    parallelismTest: bool = False,
+    ncol_max: int = 4,
+    colormap: ListedColormap = None,
+    save_file_path: str | None = None,
+    save_csv_path: str | None = None
+) -> plt.Figure:
+    n_biomarker = len(name_biomarkers)
+    n_covariate = len(name_covariates)
+    n_row, n_col = n2mfrow(n_biomarker, ncol_max)
+    if colormap is None:
+        colormap = plt.colormaps["Set1"]
+
+    results = []
+    y_data = df[name_biomarkers].values
+    x_data = df.TIME.values
+    x_data_offset = x_data + df.offsetT.values if 'offsetT' in df.columns else x_data
+
+    fig, axs = plt.subplots(
+        n_row,
+        n_col,
+        figsize=(n_col * 3 + 2, n_row * 3),  # Adjust figure size to accommodate legend
+        tight_layout=True,
+        dpi=300,
+        sharex="row",
+    )
+
+
+    for k, ax in enumerate(axs.flat):
+        if k >= n_biomarker:
+            ax.axis("off")
+            continue
+
+        valid_idx = ~np.isnan(y_data[:, k])
+        x_valid = x_data[valid_idx]
+        y_valid = y_data[valid_idx, k]
+        x_valid_offset = x_data_offset[valid_idx]
+
+        slope_offset, ci_offset, slope_no_offset, ci_no_offset, p_value = None, None, None, None, None
+        legend_entries = []
+
+        if len(x_valid) > 1 and np.var(x_valid) > 0:
+            slope, intercept, r_value, p_value, std_err = linregress(x_valid, y_valid)
+            ci = 1.96 * std_err
+            y_pred = slope * x_valid + intercept
+            line, = ax.plot(x_valid, y_pred, c="red", lw=4, label=f"Observation: {slope:.3f} ± {ci:.3f}")
+            legend_entries.append(line)
+            slope_no_offset, ci_no_offset = slope, ci
+
+        if len(x_valid_offset) > 1 and np.var(x_valid_offset) > 0:
+            slope, intercept, r_value, p_value, std_err = linregress(x_valid_offset, y_valid)
+            ci = 1.96 * std_err
+            y_pred = slope * x_valid_offset + intercept
+            line, = ax.plot(x_valid_offset, y_pred, c="blue", lw=4, label=f"DiseaseTime: {slope:.3f} ± {ci:.3f}")
+            legend_entries.append(line)
+            slope_offset, ci_offset = slope, ci
+
+        significant = False
+        if parallelismTest and slope_no_offset is not None and slope_offset is not None:
+            df_parallel = pd.DataFrame({
+                "y": np.concatenate([y_valid, y_valid]),
+                "x": np.concatenate([x_valid, x_valid_offset]),
+                "group": np.concatenate([np.zeros_like(y_valid), np.ones_like(y_valid)])
+            })
+            model = smf.ols("y ~ x * group", data=df_parallel).fit()
+            p_value = model.pvalues["x:group"]
+            significant = p_value < 0.05
+            results.append({
+                "Biomarker": name_biomarkers[k],
+                "Slope_No_Offset": slope_no_offset,
+                "CI_No_Offset": ci_no_offset,
+                "Slope_Offset": slope_offset,
+                "CI_Offset": ci_offset,
+                "P-Value": p_value,
+                "Significant": significant
+            })
+
+        if significant:
+            ax.set_title(name_biomarkers[k], fontsize=15, color='red')
+        else:
+            ax.set_title(name_biomarkers[k], fontsize=15)
+
+        if legend_entries:
+            ax.legend(loc='upper right', fontsize=9)
+
+    if parallelismTest and results:
+        df_results = pd.DataFrame(results)
+
+    if save_file_path is not None:
+        fig.savefig(save_file_path, transparent=True, bbox_inches="tight")
+
+    if save_csv_path is not None:
+        df_results.to_csv(save_csv_path, index=False)
+
+    return fig
+
+def prediction_plot___(
+    sreft: tf.keras.Model,
+    df: pd.DataFrame,
+    name_biomarkers: list[str],
+    name_covariates: list[str],
+    scaler_y: sp.StandardScaler,
+    scaler_cov: sp.StandardScaler,
+    res: int = 100,
+    density: bool = False,
+    useOffsetT: bool = True,
+    ncol_max: int = 4,
+    colormap: ListedColormap = None,
+    save_file_path: str | None = None,
+) -> plt.Figure:
+    """
+    Plot the predictions of the SReFT model.
+
+    Args:
+        sreft (tf.keras.Model): The SReFT model.
+        df (pd.DataFrame): DataFrame with the data.
+        name_biomarkers (list[str]): The names of the biomarkers.
+        name_covariates (list[str]): The names of the covariates.
+        scaler_y (sp.StandardScaler): The scaler for the y values.
+        scaler_cov (sp.StandardScaler): The scaler for the covariate values.
+        res (int, optional): Resolution of the plot. Defaults to 100.
+        density (bool, optional): Whether to plot density or not. Defaults to False.
+        useOffsetT (bool, optional): Whether to use offsetT or not. Defaults to True.
+        ncol_max (int, optional): Maximum number of columns for subplots. Defaults to 4.
+        save_file_path (str, optional): The path where the plot will be saved. Default to None.
+
+    Returns:
+        plt.Figure: The plotted figure.
+    """
+    from sklearn.linear_model import LinearRegression
+    from scipy.stats import t
+
+    n_biomarker = len(name_biomarkers)
+    n_covariate = len(name_covariates)
+    n_row, n_col = n2mfrow(n_biomarker, ncol_max)
+    if colormap is None:
+        colormap = plt.colormaps["Set1"]
+
+    y_data = df[name_biomarkers].values
+    x_data = df.TIME.values + df.offsetT.values if useOffsetT else df.TIME.values
+
+    if useOffsetT:
+        cov_dummy = np.array([i for i in itertools.product([0, 1], repeat=n_covariate)])
+        cov_dummy = np.repeat(cov_dummy, res, axis=0)
+        cov_dummy_scaled = scaler_cov.transform(cov_dummy)
+        x_model = np.linspace(x_data.min(), x_data.max(), res)
+        x_model = np.tile(x_model, 2**n_covariate).reshape(-1, 1)
+        x_model = np.concatenate((x_model, cov_dummy_scaled), axis=1)
+        y_model = scaler_y.inverse_transform(sreft.model_y(x_model))
+    else:
+        x_model = np.linspace(x_data.min(), x_data.max(), res).reshape(-1, 1)
+        y_model = scaler_y.inverse_transform(sreft.model_y(x_model))
+
+    fig, axs = plt.subplots(
+        n_row,
+        n_col,
+        figsize=(n_col * 4, n_row * 4),
+        tight_layout=False,
+        dpi=300,
+        sharex="row",
+    )
+    fig.subplots_adjust(left=0.1, right=0.9, top=0.9, bottom=0.1, wspace=0.3, hspace=0.3)
+
+    for k, ax in enumerate(axs.flat):
+        if k >= n_biomarker:
+            ax.axis("off")
+            continue
+
+        if density:
+            x_ = x_data[~np.isnan(y_data[:, k])]
+            y_ = y_data[~np.isnan(y_data[:, k]), k]
+            if np.var(x_) == 0:
+                z = gaussian_kde(y_)(y_)
+            else:
+                xy = np.vstack([x_, y_])
+                z = gaussian_kde(xy)(xy)
+            idx = z.argsort()
+            ax.scatter(x_[idx], y_[idx], c=z[idx], s=2, label="_nolegend_")
+        else:
+            ax.scatter(x_data, y_data[:, k], c="silver", s=2, label="_nolegend_")
+
+        if useOffsetT:
+            for i in range(2**n_covariate):
+                ax.plot(
+                    x_model[res * i : res * (i + 1), 0],
+                    y_model[res * i : res * (i + 1), k],
+                    c=colormap(i),
+                    lw=4,
+                )
+            ax.set_xlabel("Disease Time (year)")
+        else:
+            # NaNを除外
+            valid_idx = ~np.isnan(y_data[:, k])
+            x_valid = x_data[valid_idx].reshape(-1, 1)
+            y_valid = y_data[valid_idx, k]
+
+            if len(y_valid) > 2:
+                model = LinearRegression().fit(x_valid, y_valid)
+                y_pred = model.predict(x_model).ravel()  # 修正: 1次元にする
+
+                # 回帰直線の傾きと切片
+                slope = model.coef_[0]
+                intercept = model.intercept_
+
+                # 残差
+                residuals = y_valid - model.predict(x_valid)
+                n = len(x_valid)
+
+                # 標準誤差（slopeとinterceptの信頼区間用）
+                s_err = np.sqrt(np.sum(residuals**2) / (n - 2))
+                x_mean = np.mean(x_valid)
+                x_var = np.sum((x_valid - x_mean) ** 2)
+
+                std_err_slope = s_err / np.sqrt(x_var)
+                std_err_intercept = s_err * np.sqrt(1 / n + (x_mean**2 / x_var))
+
+                # t値
+                t_val = t.ppf(0.975, df=n - 2)
+
+                # 95%信頼区間
+                slope_ci = (slope - t_val * std_err_slope, slope + t_val * std_err_slope)
+                intercept_ci = (intercept - t_val * std_err_intercept, intercept + t_val * std_err_intercept)
+
+                # 信頼区間の幅
+                ci = t_val * s_err * np.sqrt(1 / n + (x_model[:, 0] - x_mean) ** 2 / x_var)  # 修正: 1次元にする
+
+                ax.plot(x_model[:, 0], y_pred, c="red", lw=4)
+                ax.fill_between(x_model[:, 0], y_pred - ci, y_pred + ci, color="red", alpha=0.2)
+
+                # 凡例に回帰直線のパラメータを追加
+                legend_label = (
+                    f"Slope: {slope:.3f} [{slope_ci[0]:.3f}, {slope_ci[1]:.3f}]\n"
+                    f"Intercept: {intercept:.3f} [{intercept_ci[0]:.3f}, {intercept_ci[1]:.3f}]"
+                )
+                ax.legend([legend_label], loc="upper left")
+
+            ax.set_xlabel("Observation Period (year)")
+
+        ax.set_title(name_biomarkers[k], fontsize=15)
+    if n_covariate > 0:
+        legend_labels = [
+            ", ".join(format(i, f"0{n_covariate}b")) for i in range(2**n_covariate)
+        ]
+        fig.legend(
+            loc="center",
+            framealpha=0,
+            bbox_to_anchor=(1.1, 0.5),
+            ncol=1,
+            title=", ".join(name_covariates),
+            labels=legend_labels,
+        )
+
+    if save_file_path is not None:
+        fig.savefig(save_file_path, transparent=True, bbox_inches="tight")
+
+    return fig
+
+
+
 def get_regression_line_label(x: pd.Series, y: pd.Series) -> str:
     """
     Generate a label for a line fitted to the given x and y data using linear regression.
@@ -222,6 +619,13 @@ def get_regression_line_label(x: pd.Series, y: pd.Series) -> str:
 
     return label_line
 
+import warnings
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+import statsmodels.api as sm
+from scipy.stats import gaussian_kde
 
 def single_panel_scatter_plot(
     df: pd.DataFrame,
@@ -231,80 +635,70 @@ def single_panel_scatter_plot(
     duplicate_key: list[str] | str | None = None,
     density: bool = False,
     identity: bool = False,
+    conf_int: bool = False,
     save_file_path: str | None = None,
 ) -> sns.axisgrid.FacetGrid:
     """
-    Draw a scatter plot using a single panel.
-
-    Args:
-        df (pd.DataFrame): Input DataFrame.
-        x_col (str): X-axis column in df.
-        y_col (str): Y-axis column in df.
-        hue (str | None, optional): Column to stratify the plot. Defaults to None.
-        duplicate_key (list[str] | str | None, optional): Specify the column name(s) from which duplicates are to be removed. Defaults to None.
-        density (bool, optional): Whether to plot density. Defaults to False.
-        identity (bool, optional): Whether to plot identity line. Defaults to False.
-        save_file_path (str, optional): The path where the plot will be saved. Default to None.
-
-    Returns:
-        sns.axisgrid.FacetGrid: FacetGrid object with the scatter plot.
+    Draw a scatter plot using a single panel with an optional regression confidence interval.
     """
     if density:
         hue = None
         warnings.warn("Since density is True, the hue option is ignored.")
 
-    if hue:
-        df_ = clean_duplicate(df, [x_col, y_col, hue], duplicate_key)
-        unique_hues = np.sort(df_[hue].unique())
-        line_kws_ = None
-    else:
-        df_ = clean_duplicate(df, [x_col, y_col], duplicate_key)
-        unique_hues = [None]
-        line_kws_ = {"color": "red"}
-
     scatter_kws_ = {"alpha": 0.5, "s": 20, "edgecolor": "none"}
+
     if density:
-        xy = df_[[x_col, y_col]].values.T
+        xy = df[[x_col, y_col]].values.T
         z = gaussian_kde(xy)(xy)
         scatter_kws_.update({"c": z, "color": None, "cmap": "viridis"})
 
     g = sns.lmplot(
-        data=df_,
+        data=df,
         x=x_col,
         y=y_col,
         hue=hue,
-        hue_order=unique_hues,
         scatter_kws=scatter_kws_,
-        line_kws=line_kws_,
+        ci=None,
     )
     g.figure.set_dpi(300)
 
     if identity:
-        if df[y_col].max() < df[x_col].min() or df[x_col].max() < df[y_col].min():
-            warnings.warn(
-                f"The data range of {x_col} and {y_col} is not covered, although idenntity=True. Skip drawing of identity line."
-            )
-        else:
-            min_ = df[[x_col, y_col]].min().max()
-            max_ = df[[x_col, y_col]].max().min()
-            g.axes[0, 0].plot([min_, max_], [min_, max_], "k--")
+        min_, max_ = df[[x_col, y_col]].min().max(), df[[x_col, y_col]].max().min()
+        g.axes[0, 0].plot([min_, max_], [min_, max_], "k--")
 
-    if hue:
-        g.axes[0, 0].legend(
-            ["_nolegend_", "dummy text", "_nolegned_"] * len(unique_hues)
-        )
-        for idx, h in enumerate(unique_hues):
-            df_hue = df_.loc[df_[hue] == h]
-            label_line = get_regression_line_label(df_hue[x_col], df_hue[y_col])
-            g.axes[0, 0].get_legend().get_texts()[idx].set_text(label_line)
-    else:
-        label_line = get_regression_line_label(df_[x_col], df_[y_col])
-        g.axes[0, 0].legend(labels=["_nolegend_", label_line])
+    X = sm.add_constant(df[x_col])
+    model = sm.OLS(df[y_col], X).fit()
+
+    x_vals = np.linspace(df[x_col].min(), df[x_col].max(), 100)
+    X_pred = sm.add_constant(x_vals)
+    preds = model.get_prediction(X_pred)
+    pred_mean = preds.predicted_mean
+
+    slope, intercept = model.params[x_col], model.params["const"]
+    slope_ci_low, slope_ci_high = model.conf_int().loc[x_col].values
+    intercept_ci_low, intercept_ci_high = model.conf_int().loc["const"].values
+    correlation = df[x_col].corr(df[y_col])
+
+    ax = g.axes[0, 0]
+    ax.plot(x_vals, pred_mean, "r-", label=(
+        f"y = {slope:.3f}x + {intercept:.3f}\n"
+        f"Slope CI: [{slope_ci_low:.3f}, {slope_ci_high:.3f}]\n"
+        f"Intercept CI: [{intercept_ci_low:.3f}, {intercept_ci_high:.3f}]\n"
+        f"Correlation: {correlation:.3f}"
+    ))
+
+    if conf_int:
+        ax.fill_between(x_vals, pred_mean + (slope_ci_low - slope) * x_vals,
+                        pred_mean + (slope_ci_high - slope) * x_vals,
+                        color='r', alpha=0.2)
+
+    ax.legend()
 
     if save_file_path is not None:
         plt.savefig(save_file_path, transparent=True, dpi=300)
 
     return g
+
 
 
 def multi_panel_scatter_plot(
@@ -419,6 +813,7 @@ def histogram_plot(
     col_name: list[str] | str,
     x_label: str,
     y_label: str,
+    bin = None,
     hue: str | None = None,
     sharex: bool = True,
     sharey: bool = True,
@@ -456,7 +851,7 @@ def histogram_plot(
         sharey=sharey,
         height=3.5,
     )
-    g.map(plt.hist, "value", alpha=0.4)
+    g.map(plt.hist, "value", alpha=0.4, bins=bin)
     g.add_legend()
     g.set_titles("")
     g.set_axis_labels(x_label, y_label)
@@ -901,10 +1296,20 @@ def surv_analysis_plot(
         for key, value in fit_model.items()
         if key not in ["title", "kmf", "naf"]
     }
+
+    # for k in ["epf", "wbf", "gpf", "llf", "lnf"]:
+    #     k_params = fit_model_parametric[k].params_
+    #     print(f"{k}:{k_params}")
+
+    # wbf_params = fit_model_parametric["wbf"].params_
+    # print(f"wbf:{wbf_params}")
+
     if only_best:
         aics = [i.AIC_ for i in fit_model_parametric.values()]
         best_model = list(fit_model_parametric.keys())[aics.index(min(aics))]
         fit_model_parametric = {best_model: fit_model_parametric[best_model]}
+        best_model_params = fit_model_parametric[best_model].params_
+        print(f"{best_model}:{best_model_params}")
 
     surv_plot = plt.figure(figsize=(5, 5), dpi=300)
     fit_model["kmf"].plot_survival_function(ci_show=ci_show, lw=2)
