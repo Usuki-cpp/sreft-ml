@@ -1,21 +1,30 @@
+"""
+plots.py
+※ 学習曲線、予測 vs 実測、SHAP、サバイバル解析などの可視化（保存含む）を司るプロットモジュールです。
+"""
+
+import os
+os.chdir("/Users/tamutomo/OneDrive - 千葉大学/lab/SReFT/ROOT")
 import itertools
 import warnings
 
 import matplotlib.pyplot as plt
+plt.rcParams['font.family'] = 'Hiragino Maru Gothic Pro'
 import numpy as np
 import pandas as pd
 import seaborn as sns
-import sys
-sys.path.append('/Users/tamutomo/miniforge3/lib/python3.10/site-packages')
 import shap
 import sklearn.preprocessing as sp
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 import tensorflow as tf
 from matplotlib.colors import ListedColormap
 from scipy.stats import gaussian_kde, linregress
 
-from .make_demodata import model_sigmoid
-from .utilities import clean_duplicate, n2mfrow
-
+from src.sreft_ml.sreftml.make_demodata import model_sigmoid
+from src.sreft_ml.sreftml.utilities import clean_duplicate, n2mfrow
+from src.sreft_ml_cpp.system.log_utils import dprint
+from adjustText import adjust_text
 
 def hp_search_plot(
     df_grid: pd.DataFrame,
@@ -107,6 +116,8 @@ def prediction_plot(
     ncol_max: int = 4,
     colormap: ListedColormap = None,
     save_file_path: str | None = None,
+    exclude_outliers: bool = False, 
+    exclude_criteria: int = 3
 ) -> plt.Figure:
     """
     Plot the predictions of the SReFT model.
@@ -123,19 +134,35 @@ def prediction_plot(
         useOffsetT (bool, optional): Whether to use offsetT or not. Defaults to True.
         ncol_max (int, optional): Maximum number of columns for subplots. Defaults to 4.
         save_file_path (str, optional): The path where the plot will be saved. Default to None.
+        exclude_outliers (bool, optional): Whether to exclude outliers based on z-score. Default to False.
+        exclude_criteria (int, optional): Z-score threshold for outlier exclusion. Default to 3.
 
     Returns:
         plt.Figure: The plotted figure.
     """
+    import numpy as np
+    import itertools
+    from scipy.stats import zscore, gaussian_kde
+    from sklearn.linear_model import LinearRegression
+    import matplotlib.pyplot as plt
+
     n_biomarker = len(name_biomarkers)
     n_covariate = len(name_covariates)
     n_row, n_col = n2mfrow(n_biomarker, ncol_max)
     if colormap is None:
         colormap = plt.colormaps["Set1"]
 
-    y_data = df[name_biomarkers].values
+    df_plot = df.copy()
+
+    if exclude_outliers:
+        # バイオマーカーごとにZスコア外れ値をNaNに置換
+        for col in name_biomarkers:
+            col_z = np.abs(zscore(df_plot[col], nan_policy="omit"))
+            df_plot.loc[col_z > exclude_criteria, col] = np.nan
+
+    y_data = df_plot[name_biomarkers].values
     if useOffsetT:
-        x_data = df.TIME.values + df.offsetT.values
+        x_data = df_plot.TIME.values + df_plot.offsetT.values
         cov_dummy = np.array([i for i in itertools.product([0, 1], repeat=n_covariate)]).astype(np.float64)
         cov_dummy = np.repeat(cov_dummy, res, axis=0)
         cov_dummy_scaled = scaler_cov.transform(cov_dummy)
@@ -144,7 +171,7 @@ def prediction_plot(
         x_model = np.concatenate((x_model, cov_dummy_scaled), axis=1)
         y_model = scaler_y.inverse_transform(sreft.model_y(x_model))
     else:
-        x_data = df.TIME.values
+        x_data = df_plot.TIME.values
 
     fig, axs = plt.subplots(
         n_row,
@@ -154,6 +181,7 @@ def prediction_plot(
         dpi=300,
         sharex="row",
     )
+
     for k, ax in enumerate(axs.flat):
         if k >= n_biomarker:
             ax.axis("off")
@@ -186,6 +214,23 @@ def prediction_plot(
 
         ax.set_title(name_biomarkers[k], fontsize=15)
 
+        # 傾きと変動係数を計算して表示
+        x_reg = x_model[:res, 0].reshape(-1, 1)
+        y_reg = y_model[:res, k]
+        reg = LinearRegression().fit(x_reg, y_reg)
+        slope = reg.coef_[0]
+        y_mean = np.mean(y_reg)
+        slope_normalized = slope / y_mean if y_mean != 0 else np.nan
+        ax.text(
+            0.05, 0.95,
+            f"normSlope={slope_normalized:.3f}",
+            transform=ax.transAxes,
+            fontsize=9,
+            verticalalignment="top",
+            horizontalalignment="left",
+            bbox=dict(facecolor='white', alpha=0.7, edgecolor='none')
+        )
+
     if n_covariate > 0:
         legend_labels = [
             ", ".join(format(i, f"0{n_covariate}b")) for i in range(2**n_covariate)
@@ -203,7 +248,6 @@ def prediction_plot(
         fig.savefig(save_file_path, transparent=True, bbox_inches="tight")
 
     return fig
-
 
 def get_regression_line_label(x: pd.Series, y: pd.Series) -> str:
     """
@@ -470,14 +514,18 @@ def histogram_plot(
 
 
 def scatter_matrix_plot(
-    df: pd.DataFrame, save_file_path: str | None = None
+    df: pd.DataFrame,
+    save_file_path: str | None = None,
+    corr_threshold: float = 0.5,
 ) -> sns.axisgrid.PairGrid:
     """
-    Plot correlation matrix.
+    Plot correlation matrix, with a threshold-based color scheme.
 
     Args:
         df (pd.DataFrame): Input DataFrame.
-        save_file_path (str, optional): The path where the plot will be saved. Default to None.
+        save_file_path (str, optional): Path where the plot will be saved. Default is None.
+        corr_threshold (float, optional): Threshold in [0, 1] for switching between
+                                          blue-based and red-based color. Default is 0.5.
 
     Returns:
         sns.axisgrid.PairGrid: PairGrid object with the correlation plot.
@@ -487,26 +535,49 @@ def scatter_matrix_plot(
         ax = plt.gca()
         ax.tick_params(bottom=False, top=False, left=False, right=False)
         sns.despine(ax=ax, bottom=True, top=True, left=True, right=True)
+
         r = x.corr(y, method="pearson")
-        norm = plt.Normalize(-1, 1)
-        facecolor = plt.get_cmap("seismic")(norm(r))
+        r_abs = abs(r)
+
+        # 0 <= r_abs <= corr_threshold の場合: 青系 (Blues)
+        # corr_threshold < r_abs <= 1 の場合: 赤系 (Reds)
+
+        if r_abs <= corr_threshold:
+            # 0 ~ corr_threshold を [0..1] に正規化
+            scale = r_abs / corr_threshold
+            facecolor = plt.get_cmap("Blues")(scale)
+        else:
+            # corr_threshold ~ 1 を [0..1] に正規化
+            scale = (r_abs - corr_threshold) / (1 - corr_threshold)
+            facecolor = plt.get_cmap("Reds")(scale)
+
+        # 背景色を設定
         ax.set_facecolor(facecolor)
-        ax.set_alpha(0)
+
+        # 背景色が淡い場合に文字色を黒、濃い場合に白が見やすい
         lightness = (max(facecolor[:3]) + min(facecolor[:3])) / 2
+        text_color = "white" if lightness < 0.7 else "black"
+
+        # 相関係数を表示
         ax.annotate(
             f"{r:.2f}",
             xy=(0.5, 0.5),
             xycoords=ax.transAxes,
-            color="white" if lightness < 0.7 else "black",
+            color=text_color,
             size=26,
             ha="center",
             va="center",
         )
 
+    # ペアプロットの作成
     g = sns.PairGrid(df)
+    # 対角線: ヒスト (kde=Falseにしている)
     g.map_diag(sns.histplot, kde=False)
+    # 下三角: 散布図
     g.map_lower(plt.scatter, s=2)
+    # 上三角: corrfunc で相関値＆色付け
     g.map_upper(corrfunc)
+
     g.figure.tight_layout()
 
     if save_file_path:
@@ -516,7 +587,7 @@ def scatter_matrix_plot(
 
 
 def correlation_plot_strata(
-    df: pd.DataFrame, name_biomarkers: list[str], strata: str = "status"
+    df: pd.DataFrame, name_biomarkers: list[str], strata: str = "status", save_file_path: str = None
 ) -> None:
     """
     Generate a heatmap and pairplot of biomarkers for each strata.
@@ -544,6 +615,7 @@ def correlation_plot_strata(
         sns.pairplot(df[df[strata] == i][name_biomarkers].reset_index(drop=True))
 
     sns.pairplot(df[name_biomarkers + [strata]], hue=strata, diag_kind="hist")
+    plt.savefig(save_file_path, transparent=True)
     return None
 
 
@@ -1149,3 +1221,250 @@ def merged_shap_bar_plot(
         plt.savefig(save_file_path, transparent=True)
 
     return fig
+
+def pca_for_biomarkers(
+    df: pd.DataFrame,
+    name_biomarkers: list,
+    output_dir: str = "./",
+    prefix: str = "pca_"
+):
+    """
+    指定されたDataFrameからname_biomarkersに含まれる列のみを抽出し、
+    PCAを行って結果を保存する関数。
+    さらに adjustText を用いて、バイオマーカーのPC1, PC2をプロットした際の
+    ラベルの重なりを自動調整するようにしている。
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        入力データフレーム
+    name_biomarkers : list
+        抽出したいバイオマーカーの列名リスト
+    output_dir : str, default "./"
+        解析結果(プロットやテーブル)の保存先ディレクトリ
+    prefix : str, default "pca_"
+        出力ファイル名の先頭につける文字列
+
+    Returns
+    -------
+    None
+    """
+
+    #---------------------------------------------------
+    # 1) データ抽出・NaN補完・標準化
+    #---------------------------------------------------
+    df_biom = df[name_biomarkers].copy()
+    # NaN をカラムごとの平均値で補完
+    df_biom.fillna(df_biom.mean(), inplace=True)
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(df_biom.values)
+
+    #---------------------------------------------------
+    # 2) PCAの実行
+    #    （成分数はmax10に制限）
+    #---------------------------------------------------
+    n_components = min(len(name_biomarkers), 10)
+    pca = PCA(n_components=n_components)
+    pca.fit(X_scaled)
+
+    # サンプルごとのPCスコア
+    scores = pca.transform(X_scaled)
+
+    # 寄与率など
+    explained_variances = pca.explained_variance_ratio_
+    cumulative_variances = np.cumsum(explained_variances)
+
+    #---------------------------------------------------
+    # 出力フォルダ準備
+    #---------------------------------------------------
+    os.makedirs(output_dir, exist_ok=True)
+
+    #---------------------------------------------------
+    # 3) PCAの結果をCSVで保存
+    #---------------------------------------------------
+    # (1) ロード（固有ベクトル, shape: (n_components, n_features)）
+    loadings = pca.components_
+    df_loadings = pd.DataFrame(
+        loadings.T,
+        columns=[f"PC{i+1}" for i in range(n_components)],
+        index=name_biomarkers
+    )
+    df_loadings.to_csv(os.path.join(output_dir, f"{prefix}pca_loadings.csv"))
+
+    # (2) 寄与率の情報
+    df_expl_var = pd.DataFrame({
+        "PC": [f"PC{i+1}" for i in range(n_components)],
+        "ExplainedVarianceRatio": explained_variances,
+        "CumulativeVarianceRatio": cumulative_variances
+    })
+    df_expl_var.to_csv(os.path.join(output_dir, f"{prefix}pca_explained_variance.csv"), index=False)
+
+    # (3) サンプルスコア
+    df_scores = pd.DataFrame(
+        scores,
+        columns=[f"PC{i+1}" for i in range(n_components)]
+    )
+    df_scores.to_csv(os.path.join(output_dir, f"{prefix}pca_scores.csv"), index=False)
+
+    #---------------------------------------------------
+    # 4) 第1主成分と第2主成分の散布図（サンプルスコア）
+    #---------------------------------------------------
+    plt.figure(figsize=(6, 5))
+    plt.scatter(scores[:, 0], scores[:, 1], alpha=0.7)
+    plt.xlabel("PC1 (%.2f%%)" % (explained_variances[0] * 100))
+    plt.ylabel("PC2 (%.2f%%)" % (explained_variances[1] * 100))
+    plt.title("PCA scatter plot (Samples)")
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"{prefix}pca_scatter.png"))
+    plt.close()
+
+    #---------------------------------------------------
+    # 5) バイオマーカーのPC1, PC2を点で可視化し、
+    #    adjustText を用いてラベルの重なりを回避
+    #---------------------------------------------------
+    # pca_loadings.csv で保存したものと同じ df_loadings を再利用
+    df_loadings_2d = df_loadings[["PC1", "PC2"]]
+
+    plt.figure(figsize=(6, 5))
+    # バイオマーカーの座標を散布図に
+    plt.scatter(df_loadings_2d["PC1"], df_loadings_2d["PC2"],
+                color="red", s=50, alpha=0.7)
+
+    # ★ テキストオブジェクトを保存するリスト
+    text_objs = []
+    for biom in df_loadings_2d.index:
+        pc1_val = df_loadings_2d.loc[biom, "PC1"]
+        pc2_val = df_loadings_2d.loc[biom, "PC2"]
+        # テキストを配置
+        txt = plt.text(pc1_val, pc2_val, biom, fontsize=9, color="blue")
+        text_objs.append(txt)
+
+    # ラベル同士が重ならないように adjustText で自動調整
+    # arrowprops を指定するとラベルから点まで矢印も引ける
+    adjust_text(
+        text_objs,
+        expand_points=(1.2, 1.2),
+        expand_text=(1.2, 1.2),
+        arrowprops=dict(arrowstyle="-", color='gray', alpha=0.3)
+    )
+
+    plt.axhline(0, color="grey", linestyle="--")
+    plt.axvline(0, color="grey", linestyle="--")
+    plt.xlabel("PC1 Loading")
+    plt.ylabel("PC2 Loading")
+    plt.title("PCA Loadings (Scatter for each biomarker)")
+
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"{prefix}pca_loadings_plot.png"), dpi=600)
+    plt.close()
+
+    dprint(f"[INFO] PCA done. Results saved in {output_dir}")
+    
+    
+
+def plot_prediction_summary(prediction_file_list, biomarker_name, output_file):
+    """
+    prediction_file_list: 各runの個別 prediction_plot の画像ファイルパスリスト
+    biomarker_name: 対象のバイオマーカー名
+    output_file: 出力先のまとめ画像パス
+    """
+    import matplotlib.pyplot as plt
+    # 3x3 のパネルで配置する例（runが9回の場合）
+    fig, axes = plt.subplots(3, 3, figsize=(12, 12))
+    for idx, file in enumerate(prediction_file_list):
+        img = plt.imread(file)
+        ax = axes[idx // 3, idx % 3]
+        ax.imshow(img)
+        ax.set_title(f"Run {idx + 1}")
+        ax.axis("off")
+    fig.suptitle(f"Prediction Plots for {biomarker_name}", fontsize=16)
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.savefig(output_file)
+    plt.close()
+    
+def save_summary_statistics(output_dir, proc_time, summary_dict, seed_value, run_count):
+    """
+    summary_dict: { "offsetT_mean": [...], "offsetT_std": [...], "val_loss_mean": [...], "val_loss_std": [...], "c_index": [...] }
+    seed_value: 各runのシード値（またはリスト）
+    run_count: 解析回数
+    """
+    import os
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    # 出力ディレクトリを構築
+    summary_output_dir = os.path.join(output_dir, proc_time)
+    if not os.path.exists(summary_output_dir):
+        os.makedirs(summary_output_dir)
+    
+    # CSVに保存
+    df_summary = pd.DataFrame(summary_dict)
+    df_summary["seed"] = seed_value
+    csv_file = os.path.join(summary_output_dir, "summary_statistics.csv")
+    df_summary.to_csv(csv_file, index=False)
+    
+    # 棒グラフ作成例：offsetT_mean, offsetT_std
+    fig, ax = plt.subplots(figsize=(8, 6))
+    runs = list(range(1, run_count + 1))
+    ax.bar(runs, summary_dict["offsetT_mean"], yerr=summary_dict["offsetT_std"],
+           capsize=5, color='skyblue')
+    ax.set_xlabel("Run")
+    ax.set_ylabel("offsetT Mean")
+    ax.set_title(f"OffsetT Mean and Std over {run_count} runs")
+    # 各バーの上に平均±stdをテキストで表示
+    for i, (mean_val, std_val) in enumerate(zip(summary_dict["offsetT_mean"], summary_dict["offsetT_std"])):
+        ax.text(i + 1, mean_val, f"{mean_val:.2f}\n±{std_val:.2f}", ha="center", va="bottom", fontsize=8)
+    bar_plot_file = os.path.join(summary_output_dir, "offsetT_summary.png")
+    plt.tight_layout()
+    plt.savefig(bar_plot_file)
+    plt.close()
+    
+def plot_survival_with_band(surv_time, survival_prob, output_file):
+    survival_prob = np.array(survival_prob)
+    lower = survival_prob * 0.95
+    upper = survival_prob * 1.05
+    plt.figure(figsize=(8, 6))
+    plt.plot(surv_time, survival_prob, label="Survival Probability", color="blue")
+    plt.fill_between(surv_time, lower, upper, color="blue", alpha=0.3, label="±5% Variation")
+    plt.xlabel("Time (years)")
+    plt.ylabel("Survival Probability")
+    plt.title("Survival Analysis with ±5% Band")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_file)
+    plt.close()
+    
+def plot_PI_overlay(pi_values_list, feature_labels, output_file):
+    """
+    pi_values_list: 各runごとのPI値のリスト（各要素はリストまたはnp.array、長さは feature_labels と同じ）
+    feature_labels: バイオマーカー名のリスト
+    output_file: 出力画像ファイルパス
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    n_runs = len(pi_values_list)
+    x = np.arange(len(feature_labels))
+    
+    plt.figure(figsize=(10, 6))
+    for run_idx, pi in enumerate(pi_values_list):
+        # runごとにバーの色や透明度を調整（例: alphaは run_idx に応じて変化）
+        if len(pi) != len(feature_labels):
+            continue  # 長さが合わなければスキップ
+        plt.bar(x, pi, alpha=0.3 + 0.7 * (run_idx / n_runs), label=f"Run {run_idx + 1}")
+    
+    plt.xticks(x, feature_labels, rotation=45, ha='right')
+    plt.xlabel("Biomarkers")
+    plt.ylabel("Permutation Importance")
+    plt.title("Overlay of Permutation Importance across runs")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_file)
+    plt.close()
+
+
+

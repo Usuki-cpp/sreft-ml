@@ -1,26 +1,39 @@
+"""
+utilities.py
+※ データ整形、スケーリング、モデル学習、評価指標など SReFT-ML に必要な汎用的な関数群を提供します。
+"""
+
+import os
+os.chdir("/Users/tamutomo/OneDrive - 千葉大学/lab/SReFT/ROOT")
 import math
 import pickle
 import subprocess
-import warnings
-
-import os
 import autograd.numpy as agnp
 import lifelines
 import numpy as np
 import pandas as pd
-import sys
-sys.path.append('/Users/tamutomo/miniforge3/lib/python3.10/site-packages')
 import shap
+import csv
+import shutil
+import matplotlib.pyplot as plt
 import sklearn.preprocessing as sp
 import statsmodels.formula.api as smf
 import tensorflow as tf
+from tensorflow import keras
+import statistics
+from lifelines.utils import concordance_index
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import mean_squared_error
-
-
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import GroupShuffleSplit
+from src.sreft_ml_cpp.system import config
+from src.sreft_ml_cpp.system.log_utils import dprint
+import warnings
+import getpass
+warnings.filterwarnings("ignore")
 class NullModel:
     def __init__(self, Intercept, TIME):
         self.params = [Intercept, TIME]
@@ -716,7 +729,7 @@ class TimePredictor:
             self.model.fit(X_train, y_train)
             y_pred = self.model.predict(X_test)
             mse = mean_squared_error(y_test, y_pred)
-            print(f'Mean Squared Error: {mse}')
+            dprint(f'Mean Squared Error: {mse}')
 
             df_predictions = pd.DataFrame(columns=['func_1', 'func_2', 'func_3', 'predicted_time'])
 
@@ -761,3 +774,420 @@ class TimePredictor:
         self.df = pd.concat([self.df, new_data_df], ignore_index=True)
         self.prepare_data()
         self.save_data()
+        
+def df_maker(main_settings,
+             path_for_original_data: str,
+             outliers_remove: bool = False,
+             data_randamize: bool = False,
+             impute_method: str = None,
+             ):
+    
+    if "GUIDE-IT" in path_for_original_data:
+        name_biomarkers = config.name_biomarkers_guide_it
+        name_covariates = config.name_covariates_GUIDE_IT
+        rename_dict = config.rename_dict_GUIDE_IT
+    elif "solvd" in path_for_original_data:
+        name_biomarkers = config.name_biomarkers_solvd
+        name_covariates = config.name_covariates_solvd
+        rename_dict = config.rename_dict_solvd
+    elif "best" in path_for_original_data:
+        name_biomarkers = config.name_biomarkers_best
+        name_covariates = config.name_covariates_best
+        rename_dict = config.rename_dict_best
+    
+    df = pd.read_csv(path_for_original_data)
+    df = (
+        df.rename(columns=rename_dict)
+          .dropna(subset=["ID", "TIME"], how="any")
+          .dropna(subset=name_biomarkers, how="all")
+          .reset_index(drop=True)
+    )
+    
+    #df[name_biomarkers] = df[name_biomarkers].fillna(df[name_biomarkers].mean())
+    
+    if outliers_remove:
+        df = remove_outliers(df, name_biomarkers)
+        dprint("外れ値を除外しました。")
+    if main_settings.impute_method != "none":
+        for col in name_biomarkers:
+            if main_settings.impute_method == "mean":
+                df[col] = df[col].fillna(df[col].mean())
+            elif main_settings.impute_method == "distribution":
+                df[col] = impute_by_distribution(df[col])
+            elif main_settings.impute_method == "zero":
+                df[col] = df[col].fillna(0)
+            else:
+                raise ValueError(f"Unknown impute method: {main_settings.impute_method}")
+        dprint(f"{main_settings.impute_method}方式で補完を行いました。")
+        
+    if data_randamize:
+        df, random_state = data_randomize(df)
+        dprint("データセットの行の順番をランダムに入れ替えました。")
+    return df, name_biomarkers, name_covariates
+
+
+def remove_outliers(df, name_biomarkers):
+    """
+    バイオマーカー列の外れ値を中央値±3SDで除外する。
+
+    Parameters:
+    - df: pandas.DataFrame（バイオマーカーを含む）
+    - name_biomarkers: list[str]（対象のバイオマーカー名）
+
+    Returns:
+    - df_out: 外れ値を除去したDataFrame（新しいコピー）
+    """
+    df_out = df.copy()
+
+    for biomarker in name_biomarkers:
+        original_len = len(df_out[biomarker].dropna())
+        median_val = df_out[biomarker].median(numeric_only=True)
+        std_val = statistics.pstdev(df_out[biomarker].dropna())
+        
+        condition = (df_out[biomarker] > median_val - std_val * 3) & (df_out[biomarker] < median_val + std_val * 3)
+        df_out.loc[~condition, biomarker] = np.nan  # 外れ値を NaN にする
+
+        dprint(f"{median_val - std_val*3:.3f} < {biomarker} < {median_val + std_val*3:.3f}")
+        dprint(f"{biomarker} 外れ値 {original_len - condition.sum()} 件削除　　削除後： {condition.sum()} 件\n")
+        
+    return df_out
+
+def data_randomize(df):
+    random_state = np.random.randint(1, 1001)
+    df = df.sample(frac=1, random_state=random_state).reset_index(drop=True)
+    
+    return df, random_state
+    
+def prepare_scaled_inputs(df, name_biomarkers, name_covariates, isMixedlm=True):
+    """
+    dfからx, cov, m, yを抽出し、それぞれをスケーリングする関数。
+    covariatesが空のときはDummyTransformerで処理する。
+
+    Returns:
+        x_scaled, cov_scaled, m_scaled, y_scaled, linreg,
+        scaler_cov, scaler_m, scaler_y
+    """
+
+    # スケーラー準備
+    if len(name_covariates) > 0:
+        scaler_cov = StandardScaler().fit(df[name_covariates].values)
+    else:
+        scaler_cov = DummyTransformer()
+
+    # 分割
+    x, cov, m, y, linreg = split_data_for_sreftml(
+        df, name_biomarkers, name_covariates, isMixedlm=isMixedlm
+    )
+
+    # スケーリング
+    x_scaled = x.values.reshape(-1, 1)
+    cov_scaled = scaler_cov.transform(cov.values)
+
+    scaler_m = StandardScaler().fit(m.values)
+    scaler_y = StandardScaler().fit(y.values)
+    m_scaled = scaler_m.transform(m.values)
+    y_scaled = scaler_y.transform(y.values)
+
+    return x_scaled, cov_scaled, m_scaled, y_scaled, linreg, scaler_cov, scaler_m, scaler_y, m
+
+
+def copy_directory(src, dst):
+    """指定されたディレクトリをコピー（存在しない場合のみ実行）"""
+    if not os.path.exists(dst):
+        shutil.copytree(src, dst)
+        dprint(f"Copied directory to {dst}")
+    else:
+        dprint(f"Directory already exists: {dst}, skipping copy.")
+
+def copy_file(src, dst):
+    """指定されたファイルをコピー（存在しない場合のみ実行）"""
+    if not os.path.exists(dst):
+        shutil.copyfile(src, dst)
+        dprint(f"Copied file to {dst}")
+    else:
+        dprint(f"File already exists: {dst}, skipping copy.")
+
+def save_execution_code(reference_dir):
+    """実行コードの保存処理を関数化"""
+    sreftml_src = "/Users/tamutomo/OneDrive - 千葉大学/lab/SReFT/ROOT/src/sreft_ml/sreftml"
+    sreftml_dst = os.path.join(reference_dir, "sreftml")
+    copy_directory(sreftml_src, sreftml_dst)
+
+    sbf_src = "/Users/tamutomo/OneDrive - 千葉大学/lab/SReFT/ROOT/src/sreft_ml_cpp/Search_Best_Function.py"
+    sbf_dst = os.path.join(reference_dir, "Search_Best_Function.py")
+    copy_file(sbf_src, sbf_dst)
+
+    dprint("実行コードを保存しました。")
+    
+def train_sreft_model(df, name_biomarkers, name_covariates,
+                      x_scaled, cov_scaled, m_scaled, y_scaled,
+                      scaler_y, callbacks, epochs, i, j, k,
+                      random_seed, output_dir, l, 
+                      utilities, sreftml_model, lr=1e-4):
+    
+    train_idx, vali_idx = next(GroupShuffleSplit(1, test_size=0.1, random_state=random_seed).split(X=df, groups=df.ID))
+
+    sreft = sreftml_model.SReFT(
+        output_dim=len(name_biomarkers),
+        latent_dim_model_1=m_scaled.shape[1],
+        latent_dim_model_y=y_scaled.shape[1],
+        activation_model_1_mid=i,
+        activation_model_1_out=j,
+        activation_model_y_mid=k,
+        random_state=random_seed,
+    )
+
+    sreft.compile(optimizer=keras.optimizers.Adam(lr))
+
+    sreft.fit(
+        (x_scaled[train_idx, :], cov_scaled[train_idx, :], m_scaled[train_idx, :], y_scaled[train_idx, :]),
+        y_scaled[train_idx, :],
+        batch_size=sum(train_idx),
+        validation_data=((x_scaled[vali_idx, :], cov_scaled[vali_idx, :], m_scaled[vali_idx, :], y_scaled[vali_idx, :]), y_scaled[vali_idx, :]),
+        epochs=epochs,
+        verbose=0,
+        callbacks=callbacks,
+    )
+
+    df = utilities.calculate_offsetT_prediction(
+        sreft, df, (x_scaled, cov_scaled, m_scaled, y_scaled), scaler_y, name_biomarkers
+    )
+    df["offsetT"] = sreft.model_1(np.concatenate((m_scaled, cov_scaled), axis=-1)).numpy()
+
+    return sreft, df, train_idx, vali_idx
+
+def save_offsetT_vs_slope_intercept_plots(df, name_biomarkers, run_save_path, plots_module):
+    """
+    各バイオマーカーに対して、offsetT と slope / intercept の相関を描画して保存する関数。
+
+    Parameters:
+        df (pd.DataFrame): 入力データフレーム（slope/intercept列が含まれている必要あり）
+        name_biomarkers (list): 対象とするバイオマーカー名のリスト
+        run_save_path (str): 保存先ディレクトリ
+        plots_module (module): scatter_plot 関数を含むプロットモジュール（例: plots）
+    """
+    slope_dir = os.path.join(run_save_path, "offsetT_vs_slope")
+    intercept_dir = os.path.join(run_save_path, "offsetT_vs_intercept")
+    os.makedirs(slope_dir, exist_ok=True)
+    os.makedirs(intercept_dir, exist_ok=True)
+
+    for biomarker in name_biomarkers:
+        if biomarker == "左心駆出率":
+            continue
+        plots_module.single_panel_scatter_plot(
+            df,
+            x_col="offsetT",
+            y_col=f"{biomarker}_slope",
+            hue=None,
+            duplicate_key="ID",
+            density=True,
+            identity=True,
+            save_file_path=os.path.join(slope_dir, f"{biomarker}_slope_vs_offsetT_scatter.png")
+        )
+        plots_module.single_panel_scatter_plot(
+            df,
+            x_col="offsetT",
+            y_col=f"{biomarker}_intercept",
+            hue=None,
+            duplicate_key="ID",
+            density=True,
+            identity=True,
+            save_file_path=os.path.join(intercept_dir, f"{biomarker}_intercept_vs_offsetT_scatter.png")
+        )
+    
+    dprint("各バイオマーカーの slope, intercept と offsetT の相関を保存しました。")
+    
+def compute_and_save_permutation_importance(
+    random_seed,
+    sreft_model,
+    cov_scaled,
+    m_scaled,
+    name_covariates,
+    m_columns,
+    run_save_path,
+    plots_module,
+    utilities_module,
+    reload_images_func=None
+):
+    """
+    Permutation Importance を計算し、プロットとCSV保存を行う関数。
+
+    Parameters:
+        random_seed (int): 乱数シード
+        sreft_model (keras.Model): 訓練済みの SReFT モデル
+        cov_scaled (np.ndarray): 共変量のスケーリング済みデータ
+        m_scaled (np.ndarray): m成分のスケーリング済みデータ
+        name_covariates (list): 共変量の名前リスト
+        m_columns (list): m成分の元のカラム名（df.m.columnsなど）
+        run_save_path (str): 保存先ディレクトリ
+        plots_module (module): プロット関数を含むモジュール（例：plots）
+        utilities_module (module): compute_permutation_importance を含むモジュール
+        reload_images_func (function, optional): UI用画像更新関数（なくてもOK）
+    """
+    # --- 計算 ---
+    mean_pi, std_pi = utilities_module.compute_permutation_importance(
+        random_seed, sreft_model, cov_scaled, m_scaled, n_sample=100
+    )
+
+    # --- プロット保存 ---
+    features = list(m_columns) + name_covariates
+    plots_module.permutation_importance_plot(
+        mean_pi,
+        std_pi,
+        feature_label=features,
+        save_file_path=os.path.join(run_save_path, "permutation_importance.png")
+    )
+    if reload_images_func:
+        reload_images_func()
+    dprint("permutation_importance を保存しました。")
+
+    # --- CSV保存 ---
+    df_pi = pd.DataFrame({
+        "feature": features,
+        "mean_pi": mean_pi,
+        "std_pi": std_pi
+    })
+    pi_csv_path = os.path.join(run_save_path, "pi_results.csv")
+    df_pi.to_csv(pi_csv_path, index=False)
+    dprint(f"[INFO] PI results saved to: {pi_csv_path}")
+
+
+def initialize_ci_results_csv(run_save_path, ci_results_filename="ci_results.csv"):
+    """
+    生存解析結果保存用のci_results.csvを初期化（存在しなければ作成）する関数。
+
+    Args:
+        run_save_path (str): 各runディレクトリへのパス
+        ci_results_filename (str): 保存するcsvファイル名
+    """
+    parent_dir = os.path.dirname(run_save_path)
+    ci_csv_path = os.path.join(parent_dir, ci_results_filename)
+
+    if not os.path.exists(ci_csv_path):
+        with open(ci_csv_path, "w", encoding="utf-8") as f:
+            f.write("run,c_index\n")
+            
+            
+def perform_survival_analysis_and_record(
+    df,
+    run_save_path,
+    survival_analysis_func,
+    surv_plot_func,
+    reload_images_func=None,
+    concordance_index_func=concordance_index,
+    ci_results_filename="ci_results.csv"
+):
+    """
+    offsetTを用いた生存解析とC-indexの記録を行う関数。
+
+    Returns:
+        c_index_lifelines (float): 計算されたC-index
+    """
+    # 必要列を作成
+    df["Dead_point_year"] = df["Dead day"] / 365.25
+    df["ALL_DEATH"] = df["DEATH"]
+    
+    
+    try:
+        fit_model = survival_analysis_func(
+            df, surv_time="Dead_point_year", event="ALL_DEATH", useOffsetT=True
+        )
+        surv_plot_func(
+            fit_model,
+            ci_show=True,
+            only_best=True,
+            save_dir_path=os.path.join(run_save_path, "")
+        )
+        if reload_images_func:
+            reload_images_func()
+    except Exception as e:
+        dprint(f"Survival analysis for ALL_DEATH failed: {e}")
+    
+        # ❗️失敗した場合も空のci_results.csvを作る
+        initialize_ci_results_csv(run_save_path, ci_results_filename)
+        parent_dir = os.path.dirname(run_save_path)
+        ci_csv_path = os.path.join(parent_dir, ci_results_filename)
+        run_number = os.path.basename(run_save_path)
+        dprint("C-index_lifelines: 0.000")
+        with open(ci_csv_path, "a", encoding="utf-8") as f:
+            f.write(f"{run_number},0.000\n")
+    
+        return 0.000  # 👈ここでC-index=0としてreturnする
+
+    # C-index 計算
+    df_c = df[["Dead_point_year", "ALL_DEATH", "offsetT", "ID"]].dropna()
+    c_index_lifelines = concordance_index_func(
+        df_c['Dead_point_year'], -df_c['offsetT'], df_c['ALL_DEATH']
+    )
+    dprint(f"C-index_lifelines: {c_index_lifelines}")
+    dprint("生存時間解析結果を保存しました。")
+
+    # --- 結果記録 ---
+    initialize_ci_results_csv(run_save_path, ci_results_filename)
+    parent_dir = os.path.dirname(run_save_path)
+    ci_csv_path = os.path.join(parent_dir, ci_results_filename)
+
+    run_number = os.path.basename(run_save_path)
+    with open(ci_csv_path, "a", encoding="utf-8") as f:
+        f.write(f"{run_number},{c_index_lifelines}\n")
+
+    return c_index_lifelines
+
+
+
+def rename_dir(old_dir_path, new_dir_path):
+    os.rename(old_dir_path, new_dir_path)
+
+def offsetT_pred_save(df, output_dir):
+    df[["ID", "offsetT"]].drop_duplicates("ID").sort_values("ID").to_csv(
+        os.path.join(output_dir, "offsetT_pred.csv"), index=False
+    )
+    return df["offsetT"].mean()
+    
+def mkdirs(old_dir_path, new_dir_name):
+    new_dir_path = f"{old_dir_path}/{new_dir_name}"
+    os.makedirs(new_dir_path)
+    return new_dir_path
+
+def make_random_numbers(loop_times: int, low: int = 1, high: int = 1000000) -> list[int]:
+    """
+    指定された回数分のランダムな整数を生成する関数。
+
+    Parameters:
+        loop_times (int): 生成する整数の数
+        low (int): 最小値（デフォルト: 1）
+        high (int): 最大値（デフォルト: 1000000）
+
+    Returns:
+        list[int]: ランダムな整数のリスト（重複なし）
+    """
+    return np.random.choice(range(low, high), size=loop_times, replace=False).tolist()
+
+
+def get_user_type() -> str:
+    """
+    実行ユーザーに応じて環境タイプを返す。
+    Returns:
+        str: "macbook" / "macmini" / "unknown"
+    """
+    user = getpass.getuser()
+    if user in "tamutomo":  # ←ここを書き換えてね！
+        return "macbook"
+    elif user in "tamura":
+        return "macmini"
+    else:
+        return "unknown"
+    
+def impute_by_distribution(series: pd.Series) -> pd.Series:
+    mean = series.mean()
+    std = series.std()
+    is_na = series.isna()
+    n_missing = is_na.sum()
+    if n_missing == 0:
+        return series
+    
+    # 元の分布に従った乱数を生成（clipで極端な値は避けてもいい）
+    imputed_values = np.random.normal(loc=mean, scale=std, size=n_missing)
+    series_filled = series.copy()
+    series_filled[is_na] = imputed_values
+    return series_filled
